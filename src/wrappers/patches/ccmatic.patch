@@ -1,0 +1,509 @@
+diff --git a/ccmatic_policy.cc b/ccmatic_policy.cc
+new file mode 100644
+index 0000000..be9cef9
+--- /dev/null
++++ b/ccmatic_policy.cc
+@@ -0,0 +1,60 @@
++#include "ccmatic_policy.hh"
++
++bool CcmaticPolicy::parse_policy(const std::string &name, Policy &out) {
++	if (name == "cc_qdel") out = CC_QDEL;
++	else if (name == "cc_probe_fast") out = CC_PROBE_FAST;
++	else if (name == "cc_probe_drain") out = CC_PROBE_DRAIN;
++	else if (name == "cc_probe_slow") out = CC_PROBE_SLOW;
++	else if (name == "cc_probe_qdel") out = CC_PROBE_QDEL;
++	else return false;
++	return true;
++}
++
++void CcmaticPolicy::apply_policy_state() {
++	bool probe_rule = policy == CC_PROBE_FAST || policy == CC_PROBE_DRAIN ||
++					  policy == CC_PROBE_QDEL;
++	state = probe_rule ? State::CONG_AVOID : State::SLOW_START;
++}
++
++void CcmaticPolicy::update_state(Time now, const SegmentData &seg) {
++	// Only cc_probe_slow leaves SLOW_START (cc_qdel) after repeated large loss.
++	if (policy == CC_PROBE_SLOW) SlowConv::update_state(now, seg);
++}
++
++void CcmaticPolicy::update_rate_cwnd_slow_conv(Time now) {
++	if (policy == CC_PROBE_SLOW) {
++		SlowConv::update_rate_cwnd_slow_conv(now);
++		return;
++	}
++
++	// Beliefs, in segs/s (rates) and ms (times).
++	const SegsRate CL = beliefs.min_c;
++	const SegsRate CU = beliefs.max_c;
++	const TimeDelta qdelL = beliefs.min_qdel;
++	const TimeDelta Rm = beliefs.min_rtt;
++	const SegsRate alphaR = MS_TO_SECS / Rm;  // MSS/Rm
++
++	SegsRate rate = CL;
++	switch (policy) {
++		case CC_PROBE_FAST:
++			rate = (CU < 2 * CL) ? CL : 2 * CL;
++			break;
++		case CC_PROBE_DRAIN:
++			rate = (CU > 2 * CL - 2 * alphaR) ? 2 * CL + alphaR : CL - alphaR;
++			break;
++		case CC_PROBE_QDEL:
++			if (CU < 1.5 * CL)
++				rate = (qdelL > Rm) ? alphaR : CL;
++			else
++				rate = (CU > 2 * CL) ? 2 * CL + alphaR : CL;
++			break;
++		default:
++			break;
++	}
++	sending_rate = std::max(rate, alphaR);  // Listing 1, line 7
++
++	// Same window cap as the authors' policies.
++	cwnd = (2 * beliefs.max_c * (Rm + Rm * JITTER_MULTIPLIER)) / MS_TO_SECS;
++	_intersend_time = MS_TO_SECS / sending_rate;
++	_the_window = cwnd;
++}
+diff --git a/ccmatic_policy.hh b/ccmatic_policy.hh
+new file mode 100644
+index 0000000..be3fe63
+--- /dev/null
++++ b/ccmatic_policy.hh
+@@ -0,0 +1,46 @@
++#ifndef CCMATICPOLICY_HH
++#define CCMATICPOLICY_HH
++
++#include <string>
++
++#include "slow_conv.hh"
++
++// The five CCmatic (NSDI'24) Listing 2 policies on top of the authors'
++// belief framework (SlowConv). cc_qdel and cc_probe_slow reuse the authors'
++// FastConv/SlowConv rate rules unchanged; the other three are Listing 2
++// transcribed. set_policy() allows switching at runtime.
++class CcmaticPolicy : public SlowConv {
++   public:
++	enum Policy { CC_QDEL, CC_PROBE_FAST, CC_PROBE_DRAIN, CC_PROBE_SLOW, CC_PROBE_QDEL };
++
++	static bool parse_policy(const std::string &name, Policy &out);
++
++	CcmaticPolicy(Policy policy, std::string logfilepath = "")
++		: SlowConv(logfilepath), policy(policy) {
++		apply_policy_state();
++	}
++
++	// Runtime selection interface (for future policy-switching controllers).
++	void set_policy(Policy p) {
++		policy = p;
++		apply_policy_state();
++	}
++	Policy get_policy() const { return policy; }
++
++	void init() override {
++		SlowConv::init();
++		apply_policy_state();
++	}
++
++   protected:
++	void update_state(Time now, const SegmentData &seg) override;
++	void update_rate_cwnd_slow_conv(Time now) override;
++
++   private:
++	Policy policy;
++	// cc_qdel and cc_probe_slow start in SLOW_START (authors' cc_qdel);
++	// the three probe policies always run their Listing 2 rule.
++	void apply_policy_state();
++};
++
++#endif
+diff --git a/makefile b/makefile
+index 85fcbfc..a6031d5 100644
+--- a/makefile
++++ b/makefile
+@@ -6,7 +6,7 @@ INCLUDES :=	-I./protobufs-default -I./udt
+ 
+ LIBS     := -ljemalloc -lm -pthread -lprotobuf -lpthread -ljemalloc
+ #$(MEMORY_STYLE)/libremyprotos.a
+-OBJECTS  := random.o memory.o memoryrange.o rat.o whisker.o whiskertree.o udp-socket.o traffic-generator.o remycc.o markoviancc.o estimators.o rtt-window.o slow_conv.o fast_conv.o slow_conv_manual.o #protobufs-default/dna.pb.o
++OBJECTS  := random.o memory.o memoryrange.o rat.o whisker.o whiskertree.o udp-socket.o traffic-generator.o remycc.o markoviancc.o estimators.o rtt-window.o slow_conv.o fast_conv.o slow_conv_manual.o ccmatic_policy.o vegas_r.o #protobufs-default/dna.pb.o
+ 
+ all: sender receiver
+ 
+diff --git a/sender.cc b/sender.cc
+index d3931f5..666f68f 100644
+--- a/sender.cc
++++ b/sender.cc
+@@ -10,6 +10,8 @@
+ #include "slow_conv.hh"
+ #include "fast_conv.hh"
+ #include "slow_conv_manual.hh"
++#include "ccmatic_policy.hh"
++#include "vegas_r.hh"
+ 
+ // see configs.hh for details
+ double TRAINING_LINK_RATE = 4000000.0/1500.0;
+@@ -29,10 +31,12 @@ int main( int argc, char *argv[] ) {
+ 	// for MarkovianCC
+ 	string delta_conf = "";
+ 	string logfilepath = "";
++	string ccmatic_policy_name = "";
++	double vegas_r_target = 0;  // queue target R (packets); required for vegas_r
+ 	// length of packet train for estimating bottleneck bandwidth
+ 	int train_length = 1;
+ 
+-	enum CCType { REMYCC, TCPCC, KERNELCC, PCC, NASHCC, MARKOVIANCC, SLOW_CONV, FAST_CONV, SLOW_CONV_MANUAL} cctype = REMYCC;
++	enum CCType { REMYCC, TCPCC, KERNELCC, PCC, NASHCC, MARKOVIANCC, SLOW_CONV, FAST_CONV, SLOW_CONV_MANUAL, CCMATIC, VEGAS_R} cctype = REMYCC;
+ 	int slow_conv_manual_inter_history = 1;
+ 
+ 	for ( int i = 1; i < argc; i++ ) {
+@@ -84,6 +88,10 @@ int main( int argc, char *argv[] ) {
+ 			traffic_params = arg.substr( 15 );
+ 		else if (arg.substr( 0, 11) == "delta_conf=")
+ 			delta_conf = arg.substr( 11 );
++		else if (arg.substr( 0, 9) == "r_target=")
++			vegas_r_target = atof(arg.substr( 9 ).c_str());
++		else if (arg.substr( 0, 7) == "policy=")
++			ccmatic_policy_name = arg.substr( 7 );
+ 		else if (arg.substr( 0, 12) == "logfilepath=")
+ 			logfilepath = arg.substr( 12 );
+ 		else if (arg.substr( 0, 13 ) == "train_length=")
+@@ -112,6 +120,10 @@ int main( int argc, char *argv[] ) {
+ 					slow_conv_manual_inter_history = stoi(num);
+ 				}
+ 			}
++			else if (cctype_str == "vegas_r")
++				cctype = CCType::VEGAS_R;
++			else if (cctype_str == "ccmatic")
++				cctype = CCType::CCMATIC;
+ 			else if (cctype_str == "fast_conv")
+ 				cctype = CCType::FAST_CONV;
+ 			else
+@@ -189,6 +201,29 @@ int main( int argc, char *argv[] ) {
+ 			connection, onduration, offduration, traffic_params);
+ 		traffic_generator.spawn_senders(1);
+ 	}
++	else if (cctype == CCType::VEGAS_R) {
++		if (!(vegas_r_target > 0)) {
++			fprintf(stderr, "vegas_r requires r_target=<R> with R > 0 (packets).\n");
++			return 1;
++		}
++		fprintf(stdout, "Using VegasR with R = %g packets.\n", vegas_r_target);
++		VegasR congctrl(vegas_r_target);
++		CTCP< VegasR > connection( congctrl, serverip, serverport, sourceport, train_length );
++		TrafficGenerator< CTCP< VegasR > > traffic_generator( connection, onduration, offduration, traffic_params );
++		traffic_generator.spawn_senders( 1 );
++	}
++	else if (cctype == CCType::CCMATIC) {
++		CcmaticPolicy::Policy policy;
++		if (!CcmaticPolicy::parse_policy(ccmatic_policy_name, policy)) {
++			fprintf(stderr, "Unknown ccmatic policy '%s'.\n", ccmatic_policy_name.c_str());
++			return 1;
++		}
++		fprintf(stdout, "Using CcmaticPolicy %s.\n", ccmatic_policy_name.c_str());
++		CcmaticPolicy congctrl(policy, logfilepath);
++		CTCP< CcmaticPolicy > connection( congctrl, serverip, serverport, sourceport, train_length );
++		TrafficGenerator< CTCP< CcmaticPolicy > > traffic_generator( connection, onduration, offduration, traffic_params );
++		traffic_generator.spawn_senders( 1 );
++	}
+ 	else if (cctype == CCType::FAST_CONV) {
+ 		fprintf(stdout, "Using FastConv.\n");
+ 		FastConv congctrl(logfilepath);
+diff --git a/vegas_r.cc b/vegas_r.cc
+new file mode 100644
+index 0000000..1c306fd
+--- /dev/null
++++ b/vegas_r.cc
+@@ -0,0 +1,55 @@
++#include "vegas_r.hh"
++
++#include <algorithm>
++#include <cmath>
++
++constexpr double VegasR::MIN_CWND;
++constexpr double VegasR::INIT_CWND;
++
++double VegasR::next_cwnd(double cwnd, double rtt, double rtt_min, double R) {
++	if (rtt - rtt_min > R * rtt / cwnd) return std::max(MIN_CWND, cwnd - 1.0);
++	return cwnd + 1.0;
++}
++
++void VegasR::init() {
++	cwnd = INIT_CWND;
++	rtt_min = inf();
++	round_min_rtt = inf();
++	round_end_seq = 0;
++	next_seq = 0;
++	updates = 0;
++	acks = 0;
++	_the_window = cwnd;
++	_intersend_time = 0;
++}
++
++void VegasR::onPktSent(int seq) { next_seq = std::max(next_seq, seq + 1); }
++
++void VegasR::end_round() {
++	// Skip the update without valid feedback.
++	if (std::isfinite(round_min_rtt) && std::isfinite(rtt_min)) {
++		cwnd = next_cwnd(cwnd, round_min_rtt, rtt_min, R);
++		_the_window = cwnd;
++		updates++;
++	}
++}
++
++void VegasR::onACK(int ack, double receiver_timestamp __attribute((unused)),
++				   double sent_time) {
++	int seq = ack - 1;  // ctcp.hh passes seq + 1
++	double rtt = now - sent_time;
++	bool valid = std::isfinite(rtt) && rtt > 0;
++	acks++;
++
++	if (seq >= round_end_seq) {
++		// ACK of a packet sent after the round began: the round is complete.
++		end_round();
++		round_end_seq = next_seq;
++		round_min_rtt = inf();
++	}
++	if (valid) {
++		// A boundary ACK contributes to the new round, not the completed one.
++		rtt_min = std::min(rtt_min, rtt);
++		round_min_rtt = std::min(round_min_rtt, rtt);
++	}
++}
+diff --git a/vegas_r.hh b/vegas_r.hh
+new file mode 100644
+index 0000000..4a11a9d
+--- /dev/null
++++ b/vegas_r.hh
+@@ -0,0 +1,76 @@
++#ifndef VEGASR_HH
++#define VEGASR_HH
++
++#include <limits>
++#include <stdexcept>
++
++#include "ccc.hh"
++
++// Single-threshold Vegas-style congestion avoidance, updated once per RTT
++// (one "round"), not per ACK:
++//
++//   if RTT - RTT_min > R * RTT / cwnd:  cwnd = max(2, cwnd - 1)
++//   else:                               cwnd += 1
++//
++// R is the queue target in packets and is required (no default). cwnd is in
++// packets, times are in ms. RTT_min is the minimum valid RTT of the
++// connection; RTT is the minimum valid sample of the completed round.
++// A round ends when the ACK of a packet sent after the round started arrives.
++// Rounds without a valid sample do not update cwnd.
++//
++// Startup: cwnd starts at 2 and only follows the rule above (no slow start).
++// This class adds no loss/timeout response. If the transport calls init(),
++// cwnd resets to 2 and RTT/round state is cleared.
++// The transport (ctcp.hh) must enforce _the_window using its ACK convention.
++// This class does not pace packets.
++class VegasR : public CCC {
++   public:
++	static constexpr double MIN_CWND = 2.0;
++	static constexpr double INIT_CWND = 2.0;
++
++	explicit VegasR(double R)
++		: R(R),
++		  now(0),
++		  cwnd(INIT_CWND),
++		  rtt_min(inf()),
++		  round_min_rtt(inf()),
++		  round_end_seq(0),
++		  next_seq(0),
++		  updates(0),
++		  acks(0) {
++		if (!(R > 0) || R > std::numeric_limits<double>::max())
++			throw std::invalid_argument("R must be a positive finite number");
++		_the_window = cwnd;
++		_intersend_time = 0;
++	}
++
++	// The update rule, separated so it can be tested directly.
++	static double next_cwnd(double cwnd, double rtt, double rtt_min, double R);
++
++	void init() override;
++	void onACK(int ack, double receiver_timestamp, double sent_time) override;
++	void onPktSent(int seq) override;
++	void set_timestamp(double t) { now = t; }
++	void set_min_rtt(double) {}
++
++	double get_cwnd() const { return cwnd; }
++	double get_rtt_min() const { return rtt_min; }
++	unsigned get_updates() const { return updates; }
++	unsigned get_acks() const { return acks; }
++
++   private:
++	static double inf() { return std::numeric_limits<double>::infinity(); }
++	void end_round();
++
++	double R;
++	double now;  // ms
++	double cwnd;
++	double rtt_min;
++	double round_min_rtt;
++	int round_end_seq;  // round ends at the ACK of a seq >= this
++	int next_seq;
++	unsigned updates;  // number of cwnd updates applied
++	unsigned acks;
++};
++
++#endif
+diff --git a/vegas_r_test.cc b/vegas_r_test.cc
+new file mode 100644
+index 0000000..ecf97de
+--- /dev/null
++++ b/vegas_r_test.cc
+@@ -0,0 +1,150 @@
++// Unit tests for the VegasR update rule. Build/run:
++//   g++ -std=c++11 -I. vegas_r_test.cc vegas_r.cc -o vegas_r_test && ./vegas_r_test
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <deque>
++#include <stdexcept>
++
++#include "vegas_r.hh"
++
++static int failures = 0;
++#define CHECK(cond)                                                  \
++	do {                                                             \
++		if (!(cond)) {                                               \
++			std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
++			failures++;                                              \
++		}                                                            \
++	} while (0)
++
++static void test_threshold() {
++	// R = 2, cwnd = 10, RTT = 100 ms: threshold = R * RTT / cwnd = 20 ms.
++	const double R = 2, cwnd = 10, rtt = 100;
++	// Below: RTT - RTT_min = 10 < 20 -> increase.
++	CHECK(VegasR::next_cwnd(cwnd, rtt, 90, R) == 11);
++	// Equal: 20 == 20 -> not "greater than" -> increase.
++	CHECK(VegasR::next_cwnd(cwnd, rtt, 80, R) == 11);
++	// Above: 21 > 20 -> decrease.
++	CHECK(VegasR::next_cwnd(cwnd, rtt, 79, R) == 9);
++	// Floor: never below 2.
++	CHECK(VegasR::next_cwnd(2, 100, 10, 1) == 2);
++	CHECK(VegasR::next_cwnd(3, 100, 10, 1) == 2);
++	// Fractional cwnd/R use floating-point arithmetic.
++	// threshold = 0.5 * 100 / 4 = 12.5 ms
++	CHECK(VegasR::next_cwnd(4, 100, 87.4, 0.5) == 3);  // 12.6 > 12.5 -> decrease
++	CHECK(VegasR::next_cwnd(4, 100, 87.5, 0.5) == 5);  // 12.5 == 12.5 -> increase
++	CHECK(VegasR::next_cwnd(4, 100, 87.6, 0.5) == 5);  // 12.4 < 12.5 -> increase
++}
++
++static void test_r_required() {
++	bool threw = false;
++	try { VegasR v(0); } catch (const std::invalid_argument &) { threw = true; }
++	CHECK(threw);
++	threw = false;
++	try { VegasR v(-1); } catch (const std::invalid_argument &) { threw = true; }
++	CHECK(threw);
++	threw = false;
++	try { VegasR v(std::nan("")); } catch (const std::invalid_argument &) { threw = true; }
++	CHECK(threw);
++}
++
++// Window-limited sender over a fixed-RTT path with the same gate as ctcp.hh
++// (seq < largest_ack + 1 + window). The queue is modelled as extra delay
++// `extra_ms` once cwnd exceeds `bdp` packets.
++struct Sim {
++	VegasR v;
++	double t;
++	int seq, largest_ack;
++	struct Ack { double due; int seq; double sent; };
++	std::deque<Ack> q;
++	Sim(double R) : v(R), t(0), seq(0), largest_ack(-1), q() {
++		v.set_timestamp(0);
++		v.init();
++	}
++	void run(double ms, double base_rtt, double bdp, double ms_per_queued_pkt) {
++		for (double end = t + ms; t < end; t += 1) {
++			v.set_timestamp(t);
++			while (!q.empty() && q.front().due <= t) {
++				Ack a = q.front();
++				q.pop_front();
++				v.onACK(a.seq + 1, 0, a.sent);
++				if (a.seq + 1 > largest_ack) largest_ack = a.seq + 1;
++			}
++			while (seq < largest_ack + 1 + v.get_the_window()) {
++				double queued = std::max(0.0, (seq - largest_ack) - bdp);
++				double rtt = base_rtt + queued * ms_per_queued_pkt;
++				v.onPktSent(seq);
++				q.push_back({t + rtt, seq, t});
++				seq++;
++			}
++		}
++	}
++};
++
++static void test_once_per_rtt() {
++	// Constant 100 ms RTT, no queueing: cwnd must grow by exactly 1 per
++	// round even though many ACKs arrive per round.
++	Sim s(3);
++	s.run(2000, 100, 1e9, 0);
++	unsigned updates = s.v.get_updates(), acks = s.v.get_acks();
++	CHECK(updates >= 18 && updates <= 21);   // ~20 RTTs in 2 s
++	CHECK(acks > 5 * updates);               // updates are not per ACK
++	CHECK(std::fabs(s.v.get_cwnd() - (2 + updates)) < 1e-9);  // +1 per update
++}
++
++static void test_queue_target() {
++	// With a queue costing 5 ms per packet beyond a BDP of 20 and R = 3,
++	// cwnd settles near BDP + R (about 3 packets queued) instead of growing.
++	Sim s(3);
++	s.run(20000, 100, 20, 5);
++	CHECK(s.v.get_cwnd() >= 20 && s.v.get_cwnd() <= 28);
++}
++
++static void test_no_valid_feedback() {
++	VegasR v(3);
++	v.set_timestamp(100);
++	v.init();
++	v.onPktSent(0);
++	v.onPktSent(1);
++	// Invalid samples (RTT <= 0): no update, no RTT_min.
++	v.onACK(1, 0, 100);   // rtt = 0
++	v.onACK(2, 0, 200);   // rtt = -100
++	CHECK(v.get_updates() == 0);
++	CHECK(!std::isfinite(v.get_rtt_min()));
++	CHECK(v.get_cwnd() == 2);
++}
++
++static void test_boundary_ack_belongs_to_next_round() {
++	VegasR v(1);
++	v.set_timestamp(0);
++	v.init();
++	v.onPktSent(0);
++	v.onPktSent(1);
++	v.set_timestamp(100);
++	v.onACK(1, 0, 0);    // seq 0, rtt 100: the (empty) first round ends
++	v.set_timestamp(180);
++	v.onPktSent(2);
++	v.onPktSent(3);
++	v.set_timestamp(190);
++	v.onACK(2, 0, 0);    // seq 1, rtt 190: inside the round
++	v.set_timestamp(200);
++	v.onACK(3, 0, 180);  // seq 2, rtt 20: boundary ACK ends the round
++	// The round was decided on its own minimum (100) against RTT_min (100):
++	// 0 <= R * 100 / 2, so cwnd increases. Counting the boundary sample (20)
++	// would have made the queue estimate 80 > 50 and decreased cwnd instead.
++	CHECK(v.get_updates() == 1);
++	CHECK(v.get_cwnd() == 3);
++	// The boundary sample still lowers the connection's RTT_min afterwards.
++	CHECK(v.get_rtt_min() == 20);
++}
++
++int main() {
++	test_boundary_ack_belongs_to_next_round();
++	test_threshold();
++	test_r_required();
++	test_once_per_rtt();
++	test_queue_target();
++	test_no_valid_feedback();
++	if (failures == 0) std::printf("ALL PASSED\n");
++	return failures == 0 ? 0 : 1;
++}

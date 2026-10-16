@@ -4,6 +4,9 @@
 *.pdf
 /tmp/
 
+.claude/
+.idea/
+
 ##### Python
 
 # Byte-compiled / optimized / DLL files

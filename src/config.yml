@@ -67,3 +67,28 @@ schemes:
     name: FillP-Sheep
     color: violet
     marker: 'D'
+  cc_qdel:
+    name: CCmatic cc_qdel
+    color: red
+    marker: 'o'
+  cc_probe_fast:
+    name: CCmatic cc_probe_fast
+    color: darkgreen
+    marker: 's'
+  cc_probe_drain:
+    name: CCmatic cc_probe_drain
+    color: navy
+    marker: '^'
+  cc_probe_slow:
+    name: CCmatic cc_probe_slow
+    color: purple
+    marker: 'v'
+  cc_probe_qdel:
+    name: CCmatic cc_probe_qdel
+    color: brown
+    marker: 'P'
+  vegas_r:
+    name: Vegas-R
+    color: teal
+    marker: 'X'
+    R: 3
